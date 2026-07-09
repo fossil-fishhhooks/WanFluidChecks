@@ -53,8 +53,8 @@ def load_clip_frames(clip_path):
 
 @torch.no_grad()
 def compute_flow_pair(model, transforms, frame_a, frame_b, device):
-    t_a = torch.from_numpy(frame_a).permute(2, 0, 1).unsqueeze(0).float()
-    t_b = torch.from_numpy(frame_b).permute(2, 0, 1).unsqueeze(0).float()
+    t_a = torch.from_numpy(frame_a).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+    t_b = torch.from_numpy(frame_b).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
     t_a, t_b = transforms(t_a, t_b)
     flow_preds = model(t_a.to(device), t_b.to(device))
     # RAFT is iterative; last prediction is the refined one

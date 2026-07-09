@@ -87,6 +87,10 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
     stream = region_frames["stream"]
     flow = load_flow_frames(flow_dir_for_clip)
 
+    # liquid union = source | stream | pool — used for flow measurement
+    liquid_union = [padded["source"][i] | padded["stream"][i] |
+                    padded["pool"][i] for i in range(len(padded["stream"]))]
+
     if not stream:
         na = {"score": None, "notes": ["no stream masks saved"]}
         taper_r, dir_r, spd_r, edge_r = dict(na), dict(na), dict(na), dict(na)
@@ -94,8 +98,8 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
         taper_r = gravity_taper(stream)
         edge_r = gravity_leading_edge(stream)
         if flow:
-            dir_r = gravity_direction(flow, stream)
-            spd_r = gravity_speedup(flow, stream)
+            dir_r = gravity_direction(flow, liquid_union)
+            spd_r = gravity_speedup(flow, liquid_union)
         else:
             miss = {"score": None,
                     "notes": ["no flow files -- run flow.py and pass --flow_dir"]}
