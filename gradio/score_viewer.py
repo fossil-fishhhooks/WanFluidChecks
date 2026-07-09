@@ -114,7 +114,7 @@ def _overlay_masks(frame, masks_dict, idx):
     return frame
 
 
-def _overlay_flow_arrows(frame, flow, mask=None, step=16, noise_floor=0.25):
+def _overlay_flow_arrows(frame, flow, mask=None, step=16, noise_floor=0.1):
     if flow is None:
         return frame
     h, w = frame.shape[:2]
@@ -129,18 +129,21 @@ def _overlay_flow_arrows(frame, flow, mask=None, step=16, noise_floor=0.25):
         for i in range(len(xs)):
             if mag[j, i] <= noise_floor:
                 continue
-            # skip arrows outside liquid mask
             if mask is not None and not mask[int(Y[j, i]), int(X[j, i])]:
                 continue
             pt1 = (int(X[j, i]), int(Y[j, i]))
-            # cap arrow length to 40px for display; color shows true magnitude
-            scale = min(1.0, 40.0 / max(mag[j, i], 1e-6))
-            ax = int(X[j, i] + dx[j, i] * scale)
-            ay = int(Y[j, i] + dy[j, i] * scale)
+            # arrow length: min 8px visible, cap at 40px; direction from (dx,dy)
+            vis_len = max(8.0, min(40.0, mag[j, i]))
+            norm = max(mag[j, i], 1e-6)
+            ax = int(X[j, i] + dx[j, i] / norm * vis_len)
+            ay = int(Y[j, i] + dy[j, i] / norm * vis_len)
             pt2 = (ax, ay)
-            t = min(1.0, mag[j, i] / 80.0)
-            # blue (slow) -> green -> red (fast)
-            color = (int(255 * t), int(200 * (1 - abs(t - 0.5) * 2)), 0)
+            # log-scale color: blue→green→red
+            t = min(1.0, np.log2(1 + mag[j, i]) / 6.0)
+            b = max(0, 1 - 2 * t)
+            g = 1 - abs(2 * t - 1)
+            r = max(0, 2 * t - 1)
+            color = (int(b * 255), int(g * 255), int(r * 255))
             cv2.arrowedLine(out, pt1, pt2, color, 1, cv2.LINE_AA, tipLength=0.3)
     return out
 
