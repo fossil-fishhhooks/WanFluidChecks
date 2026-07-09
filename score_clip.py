@@ -21,7 +21,6 @@ import cv2
 from checks import (
     volume_check,
     color_consistency,
-    compensate_background_motion,
     gravity_taper,
     gravity_direction,
     gravity_speedup,
@@ -88,7 +87,6 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
     stream = region_frames["stream"]
     flow = load_flow_frames(flow_dir_for_clip)
 
-    drift_info = None
     if not stream:
         na = {"score": None, "notes": ["no stream masks saved"]}
         taper_r, dir_r, spd_r, edge_r = dict(na), dict(na), dict(na), dict(na)
@@ -96,22 +94,8 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
         taper_r = gravity_taper(stream)
         edge_r = gravity_leading_edge(stream)
         if flow:
-            # background = everything that isn't liquid; compensate
-            # camera/scene drift that RAFT paints into the textureless
-            # stream interior
-            n_liquid = min(len(flow), len(padded[REGIONS[0]]))
-            liquid_union = [
-                np.logical_or.reduce([padded[r][i] for r in REGIONS])
-                for i in range(n_liquid)
-            ]
-            flow_c, drifts = compensate_background_motion(flow, liquid_union)
-            drift_mags = [float(np.hypot(dx, dy)) for dx, dy in drifts]
-            drift_info = {
-                "per_frame_drift": drifts,
-                "mean_drift_magnitude": float(np.mean(drift_mags)) if drift_mags else 0.0,
-            }
-            dir_r = gravity_direction(flow_c, stream)
-            spd_r = gravity_speedup(flow_c, stream)
+            dir_r = gravity_direction(flow, stream)
+            spd_r = gravity_speedup(flow, stream)
         else:
             miss = {"score": None,
                     "notes": ["no flow files -- run flow.py and pass --flow_dir"]}
@@ -137,7 +121,6 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
     return {
         "volume_check": vol,
         "color_check": color_r,
-        "background_drift": drift_info,
         "gravity_taper": taper_r,
         "gravity_direction": dir_r,
         "gravity_speedup": spd_r,
@@ -154,7 +137,7 @@ def _fmt(x):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--masks_dir", required=True)
-    parser.add_argument("--clips_dir", default=None,
+    parser.add_argument("--clips_dir", default="./clips",
                         help="original clips; enables the color check")
     parser.add_argument("--flow_dir", default=None)
     parser.add_argument("--out_dir", default="./results")
@@ -205,11 +188,6 @@ def main():
         all_notes = (result["volume_check"].get("notes", [])
                      + result["color_check"].get("notes", [])
                      + result["gravity_combined"].get("notes", []))
-        drift = result.get("background_drift")
-        if drift and drift["mean_drift_magnitude"] > 0.3:
-            all_notes.append(
-                f"compensated camera/scene drift of "
-                f"{drift['mean_drift_magnitude']:.2f} px/frame")
         seen = set()
         for note in all_notes:
             if note not in seen:

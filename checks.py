@@ -177,10 +177,12 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
       - coherence: |sum(v)| / sum(|v|) >= min_coherence, else NA
         ("flow present but incoherent / shimmer")
 
-    When gated in: score = downward component of the mean flow vector
-    (1 = straight down, 0 = horizontal or upward).
+    When gated in: score = fraction of absolute stream motion that is
+    vertical (up OR down), so a fountain arc with strong up-and-down
+    motion scores well while purely horizontal drift scores 0.
     """
     sum_v = np.zeros(2, dtype=np.float64)
+    abs_sum_v = np.zeros(2, dtype=np.float64)
     sum_mag = 0.0
     n_stream_px, n_moving_px = 0, 0
     mags_all = []
@@ -192,7 +194,7 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
         if mask.shape != flow.shape[:2] or not mask.any():
             continue
         n_aligned += 1
-        v = flow[mask]                      # (N, 2)
+        v = flow[mask]
         mag = np.linalg.norm(v, axis=1)
         mags_all.append(mag)
         n_stream_px += len(mag)
@@ -200,6 +202,7 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
         n_moving_px += int(moving.sum())
         if moving.any():
             sum_v += v[moving].sum(axis=0)
+            abs_sum_v += np.abs(v[moving]).sum(axis=0)
             sum_mag += float(mag[moving].sum())
 
     if n_aligned == 0:
@@ -230,18 +233,24 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
                           f"direction signal"]}
 
     mean_dir = sum_v / np.linalg.norm(sum_v)
-    downward_component = float(mean_dir[1])  # +y = down in image coords
-    score = max(0.0, downward_component)
+    total_abs = float(abs_sum_v[0] + abs_sum_v[1])
+    if total_abs < 1e-10:
+        vertical_frac = 0.0
+    else:
+        vertical_frac = float(abs_sum_v[1] / total_abs)
+    score = vertical_frac
 
     return {
         "mean_flow_magnitude": mean_mag,
         "moving_fraction": float(moving_frac),
         "coherence": coherence,
         "mean_direction_xy": [float(mean_dir[0]), float(mean_dir[1])],
+        "vertical_fraction": vertical_frac,
         "score": float(score),
-        "notes": [] if downward_component > 0 else
-                 ["coherent stream motion points sideways/up -- "
-                  "physically wrong for a pour"],
+        "notes": [] if vertical_frac > 0.4 else
+                 ["flow is dominated by horizontal motion "
+                  f"(vertical_fraction={vertical_frac:.2f}) -- no strong "
+                  f"vertical component from gravity"],
     }
 
 
@@ -250,13 +259,23 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
 def gravity_speedup(flow_by_frame, stream_masks_by_frame,
                     noise_floor=0.25, min_bin_pixels=8, min_samples=5):
     """
-    Free-fall kinematics in a steady stream: v^2 = v0^2 + 2*a*(y - y0),
-    so mean downward speed squared, binned by height, should be linear
-    in y with positive slope. Bin count adapts to stream height.
+    Free-fall kinematics under gravity: v^2 = v0^2 + 2*a*(y - y0).
 
-    score = R^2 of the linear fit if slope > 0, else R^2 * 0.2.
+    Unlike v1 (which assumed strictly downward flow), this version:
+      - Accepts ANY significant vertical motion (up OR down)
+      - Checks that the slope sign is consistent with gravity:
+        * downward-moving parcels (mean vy > 0) should ACCELERATE
+          (positive slope of v^2 vs y)
+        * upward-moving parcels (mean vy < 0) should DECELERATE
+          (negative slope of v^2 vs y)
+      - A fountain's rising jet (decelerating against gravity) is
+        therefore scored correctly instead of penalized.
+
+    score = R^2 of the linear fit if slope sign is consistent with
+    flow direction, else R^2 * 0.2.
     """
     samples_y, samples_v2 = [], []
+    sum_vy, count_vy = 0.0, 0
     n = min(len(flow_by_frame), len(stream_masks_by_frame))
 
     for i in range(n):
@@ -265,10 +284,12 @@ def gravity_speedup(flow_by_frame, stream_masks_by_frame,
             continue
         ys, xs = np.nonzero(mask)
         vy = flow[ys, xs, 1]
-        keep = vy > noise_floor          # downward-moving above noise
+        keep = np.abs(vy) > noise_floor
         if keep.sum() < min_bin_pixels * 2:
             continue
         ys_k, vy_k = ys[keep], vy[keep]
+        sum_vy += float(vy_k.sum())
+        count_vy += len(vy_k)
 
         height = ys_k.max() - ys_k.min()
         n_bins = int(np.clip(height // 12, 3, 16))
@@ -296,18 +317,27 @@ def gravity_speedup(flow_by_frame, stream_masks_by_frame,
     ss_tot = float(np.sum((v2_arr - v2_arr.mean()) ** 2))
     r2 = max(0.0, min(1.0, 1.0 - ss_res / ss_tot)) if ss_tot > 1e-9 else 0.0
 
-    slope_ok = bool(slope > 0)
+    mean_vy = sum_vy / count_vy if count_vy > 0 else 0.0
+    if mean_vy >= 0:
+        slope_ok = bool(slope > 0)
+    else:
+        slope_ok = bool(slope < 0)
     score = r2 if slope_ok else r2 * 0.2
+
+    notes = []
+    if not slope_ok:
+        notes.append(f"v^2 vs y slope has wrong sign (slope={slope:.2f}, "
+                     f"mean_vy={mean_vy:.2f}) -- water "
+                     f"{'accelerates upward' if mean_vy < 0 else 'slows while falling'}")
 
     return {
         "n_samples": len(samples_y),
         "slope_v2_vs_y": float(slope),
         "slope_sign_ok": slope_ok,
+        "mean_vertical_velocity": float(mean_vy),
         "r_squared": float(r2),
         "score": float(score),
-        "notes": [] if slope_ok else
-                 ["v^2 DECREASES with fall distance -- stream slows while "
-                  "falling, physically wrong"],
+        "notes": notes,
     }
 
 
@@ -502,7 +532,7 @@ def _splash_row_band(stream_masks, frac=0.12):
 
 
 def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
-                      gain_tau=0.30, min_pixels=30):
+                      gain_tau=0.15, min_pixels=30):
     """
     Fluid appearance check. Physical model: apparent fluid color =
     background transmitted through water + a stable intrinsic tint.
@@ -521,6 +551,10 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
         across frames  x  exp(-positive-tint-gains / tau)
       spatial (0.3, stream only): hue stability along stream rows, with
         a bonus when tint magnitude tracks stream width (thin -> clearer)
+      source_abrupt: multiplicative penalty on temporal when the SOURCE
+        region undergoes a large-scale (>15% area) color change of
+        >10 dE in a single frame step -- indicates generated artifacts
+        like color bleeding or texture popping.
 
     frames_bgr must align 1:1 with mask frames.
     """
@@ -593,6 +627,29 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
 
     temporal = hue_stability * gain_factor
 
+    # ---- source abrupt-change penalty ----
+    source_masks = region_masks_by_frame.get("source", [])
+    source_penalty = 1.0
+    dE_threshold = 10.0
+    area_threshold = 0.15
+    worst_frac = 0.0
+    n_src = min(n, len(source_masks))
+    for i in range(n_src - 1):
+        s0, s1 = source_masks[i], source_masks[i + 1]
+        if not s0.any() or not s1.any():
+            continue
+        overlap = s0 & s1
+        if overlap.sum() < min_pixels:
+            continue
+        delta = lab[i + 1][overlap] - lab[i][overlap]
+        dE = np.sqrt((delta ** 2).sum(axis=1))
+        frac = float((dE > dE_threshold).sum() / overlap.sum())
+        if frac > worst_frac:
+            worst_frac = frac
+    if worst_frac > area_threshold:
+        source_penalty = max(0.0, 1.0 - 3.0 * (worst_frac - area_threshold))
+        temporal *= source_penalty
+
     # ---- spatial: along-stream hue consistency + thin->clear bonus ----
     row_hue, row_chroma, row_mag, row_w = [], [], [], []
     for i in range(min(n, len(stream_masks))):
@@ -645,6 +702,10 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
         notes.append(f"fluid gains tint over time (jump p90={gain_p:.2f}, "
                      f"net drift={net_gain:.2f}) -- spontaneous coloring/"
                      f"murk; fading to clear would not be penalized")
+    if worst_frac > area_threshold:
+        notes.append(f"large abrupt color change in source region: "
+                     f"{100*worst_frac:.0f}% of area shifted by >{dE_threshold} "
+                     f"dE between consecutive frames")
 
     return {
         "n_frames_used": len(tints),
@@ -656,6 +717,11 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
         "spatial_score": None if spatial is None else float(spatial),
         "width_tint_spearman": width_tint_rho,
         "splash_band_rows": band,
+        "source_abrupt_change": {
+            "worst_fraction": float(worst_frac),
+            "dE_threshold": dE_threshold,
+            "penalty": float(source_penalty),
+        },
         "score": float(score),
         "notes": notes,
     }
