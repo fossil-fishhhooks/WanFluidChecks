@@ -9,6 +9,8 @@ from datetime import datetime
 warnings.filterwarnings('ignore')
 
 import random
+import re
+import json
 
 import torch
 import torch.distributed as dist
@@ -66,6 +68,12 @@ def _validate_args(args):
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
     assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
     assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
+
+    # Batch mode is only wired into the t2v/t2i path
+    if args.num_videos > 1 or args.prompts or args.prompts_file:
+        assert "t2v" in args.task or "t2i" in args.task, \
+            "--num_videos/--prompts/--prompts_file are only supported for t2v/t2i tasks."
+    assert args.num_videos >= 1, "--num_videos must be >= 1"
 
     # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
     if args.sample_steps is None:
@@ -182,6 +190,27 @@ def _parse_args():
         default=None,
         help="The prompt to generate the image or video from.")
     parser.add_argument(
+        "--prompts",
+        type=str,
+        nargs="+",
+        default=None,
+        help="[t2v/t2i only] Multiple prompts; --num_videos jobs are split round-robin across them (2 prompts + 10 videos = 5 each).")
+    parser.add_argument(
+        "--prompts_file",
+        type=str,
+        default=None,
+        help="[t2v/t2i only] Text file with one prompt per line (blank lines and lines starting with # are ignored). Takes priority over --prompts/--prompt.")
+    parser.add_argument(
+        "--num_videos",
+        type=int,
+        default=1,
+        help="[t2v/t2i only] Total videos to generate in one run. Model is loaded once; seeds increment from --base_seed.")
+    parser.add_argument(
+        "--clips_dir",
+        type=str,
+        default=None,
+        help="Directory to save outputs into (created if missing). A manifest.json mapping filename -> prompt/seed/settings is maintained there.")
+    parser.add_argument(
         "--use_prompt_extend",
         action="store_true",
         default=False,
@@ -263,6 +292,39 @@ def _init_logging(rank):
         logging.basicConfig(level=logging.ERROR)
 
 
+def _slugify(prompt, max_len=40):
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", prompt).strip("_").lower()
+    return safe[:max_len].rstrip("_") or "clip"
+
+
+def _build_prompt_list(args):
+    if args.prompts_file:
+        with open(args.prompts_file, "r", encoding="utf-8") as f:
+            prompts = [ln.strip() for ln in f
+                       if ln.strip() and not ln.strip().startswith("#")]
+        assert prompts, f"No prompts found in {args.prompts_file}"
+        return prompts
+    if args.prompts:
+        return list(args.prompts)
+    if args.prompt:
+        return [args.prompt]
+    return [EXAMPLE_PROMPT[args.task]["prompt"]]
+
+
+def _update_manifest(clips_dir, filename, entry):
+    manifest_path = os.path.join(clips_dir, "manifest.json")
+    manifest = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception:
+            manifest = {}
+    manifest[filename] = entry
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+
 def generate(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -331,30 +393,36 @@ def generate(args):
         args.base_seed = base_seed[0]
 
     if "t2v" in args.task or "t2i" in args.task:
-        if args.prompt is None:
-            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
-        logging.info(f"Input prompt: {args.prompt}")
+        prompt_list = _build_prompt_list(args)
+        logging.info(f"Input prompts ({len(prompt_list)}):")
+        for p in prompt_list:
+            logging.info(f"  - {p}")
+
         if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
-            if rank == 0:
-                prompt_output = prompt_expander(
-                    args.prompt,
-                    tar_lang=args.prompt_extend_target_lang,
-                    seed=args.base_seed)
-                if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
-                    input_prompt = args.prompt
+            extended_prompts = []
+            for p_idx, p in enumerate(prompt_list):
+                logging.info(
+                    f"Extending prompt {p_idx + 1}/{len(prompt_list)} ...")
+                if rank == 0:
+                    prompt_output = prompt_expander(
+                        p,
+                        tar_lang=args.prompt_extend_target_lang,
+                        seed=args.base_seed)
+                    if prompt_output.status == False:
+                        logging.info(
+                            f"Extending prompt failed: {prompt_output.message}")
+                        logging.info("Falling back to original prompt.")
+                        input_prompt = p
+                    else:
+                        input_prompt = prompt_output.prompt
+                    input_prompt = [input_prompt]
                 else:
-                    input_prompt = prompt_output.prompt
-                input_prompt = [input_prompt]
-            else:
-                input_prompt = [None]
-            if dist.is_initialized():
-                dist.broadcast_object_list(input_prompt, src=0)
-            args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
+                    input_prompt = [None]
+                if dist.is_initialized():
+                    dist.broadcast_object_list(input_prompt, src=0)
+                extended_prompts.append(input_prompt[0])
+                logging.info(f"Extended prompt: {input_prompt[0]}")
+            prompt_list = extended_prompts
 
         logging.info("Creating WanT2V pipeline.")
         wan_t2v = wan.WanT2V(
@@ -368,18 +436,83 @@ def generate(args):
             t5_cpu=args.t5_cpu,
         )
 
-        logging.info(
-            f"Generating {'image' if 't2i' in args.task else 'video'} ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        # Round-robin job list: video i uses prompt (i mod n_prompts),
+        # seed = base_seed + i so every clip is distinct but reproducible.
+        jobs = [(prompt_list[i % len(prompt_list)], args.base_seed + i)
+                for i in range(args.num_videos)]
+
+        out_dir = args.clips_dir
+        if out_dir is None and len(jobs) > 1:
+            out_dir = "./clips"  # sensible default for batch runs
+        if out_dir is not None and rank == 0:
+            os.makedirs(out_dir, exist_ok=True)
+
+        suffix = '.png' if "t2i" in args.task else '.mp4'
+        for job_idx, (job_prompt, job_seed) in enumerate(jobs):
+            logging.info(
+                f"[{job_idx + 1}/{len(jobs)}] Generating "
+                f"{'image' if 't2i' in args.task else 'video'} | "
+                f"seed={job_seed} | prompt: {job_prompt}")
+            video = wan_t2v.generate(
+                job_prompt,
+                size=SIZE_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=job_seed,
+                offload_model=args.offload_model)
+
+            if rank == 0:
+                if args.save_file is not None and len(jobs) == 1:
+                    save_path = args.save_file
+                else:
+                    filename = (f"{job_idx:03d}_{_slugify(job_prompt)}"
+                                f"_s{job_seed}{suffix}")
+                    save_path = (os.path.join(out_dir, filename)
+                                 if out_dir else filename)
+
+                if "t2i" in args.task:
+                    logging.info(f"Saving generated image to {save_path}")
+                    saved = cache_image(
+                        tensor=video.squeeze(1)[None],
+                        save_file=save_path,
+                        nrow=1,
+                        normalize=True,
+                        value_range=(-1, 1))
+                else:
+                    logging.info(f"Saving generated video to {save_path}")
+                    saved = cache_video(
+                        tensor=video[None],
+                        save_file=save_path,
+                        fps=cfg.sample_fps,
+                        nrow=1,
+                        normalize=True,
+                        value_range=(-1, 1))
+                if saved is None:
+                    logging.error(
+                        f"Save FAILED for {save_path} -- see cache error above. "
+                        f"Continuing with remaining jobs.")
+                elif out_dir is not None:
+                    _update_manifest(out_dir, os.path.basename(save_path), {
+                        "prompt": job_prompt,
+                        "seed": job_seed,
+                        "task": args.task,
+                        "size": args.size,
+                        "frame_num": args.frame_num,
+                        "sample_steps": args.sample_steps,
+                        "sample_shift": args.sample_shift,
+                        "guide_scale": args.sample_guide_scale,
+                    })
+
+            # free VRAM between jobs -- matters when running near capacity
+            del video
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        logging.info("Finished.")
+        return
 
     elif "i2v" in args.task:
         if args.prompt is None:
@@ -561,6 +694,11 @@ def generate(args):
                                                                      "_")[:50]
             suffix = '.png' if "t2i" in args.task else '.mp4'
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+
+        if args.clips_dir is not None:
+            os.makedirs(args.clips_dir, exist_ok=True)
+            args.save_file = os.path.join(args.clips_dir,
+                                          os.path.basename(args.save_file))
 
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")

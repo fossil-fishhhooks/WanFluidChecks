@@ -29,8 +29,8 @@ import cv2
 import numpy as np
 
 # --- CONFIG: adjust these to your local SAM2 install ---
-SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
-SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_base_plus.pt"
+SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 # ---------------------------------------------------------
 
 REGION_TO_OBJ_ID = {"source": 1, "stream": 2, "pool": 3}
