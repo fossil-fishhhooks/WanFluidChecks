@@ -856,8 +856,10 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
 
 # --------------------------- combination ---------------------------
 
-GRAVITY_WEIGHTS = {"taper": 0.45, "direction": 0.10,
-                   "speedup": 0.10, "leading_edge": 0.35}
+# Tuned interactively in the score_viewer weights tab (raw sliders:
+# taper 0.35, direction 0.25, speedup 0.85, leading edge 0.25)
+GRAVITY_WEIGHTS = {"taper": 0.206, "direction": 0.147,
+                   "speedup": 0.500, "leading_edge": 0.147}
 
 
 def combine_gravity(taper_r, direction_r, speedup_r, edge_r):
@@ -874,7 +876,7 @@ def combine_gravity(taper_r, direction_r, speedup_r, edge_r):
 
 
 def composite_score(volume_result, gravity_combined, color_result=None,
-                    w_volume=0.35, w_gravity=0.40, w_color=0.25):
+                    w_volume=0.407, w_gravity=0.370, w_color=0.222):
     axes = {"volume": (volume_result["score"], w_volume),
             "gravity": (gravity_combined["score"], w_gravity),
             "color": (None if color_result is None else color_result["score"],

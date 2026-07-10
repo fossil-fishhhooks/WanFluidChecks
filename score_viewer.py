@@ -311,6 +311,80 @@ def build_score_html(result):
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Weight-tuning tab
+# ---------------------------------------------------------------------------
+
+GRAV_KEYS = ["gravity_taper", "gravity_direction", "gravity_speedup",
+             "gravity_leading_edge"]
+GRAV_LABELS = ["taper", "direction", "speedup", "leading_edge"]
+
+
+def load_all_results(results_dir):
+    """clip -> {volume, color, grav components, mask_ok} for recomputation."""
+    rows = {}
+    if not os.path.isdir(results_dir):
+        return rows
+    for f in sorted(os.listdir(results_dir)):
+        if not f.endswith(".json"):
+            continue
+        with open(os.path.join(results_dir, f)) as fh:
+            r = json.load(fh)
+        s = r.get("scores", {})
+        rows[f[:-5]] = {
+            "volume": s.get("volume_score"),
+            "color": s.get("color_score"),
+            "grav": {lbl: r.get(k, {}).get("score")
+                     for k, lbl in zip(GRAV_KEYS, GRAV_LABELS)},
+            "mask_ok": r.get("stream_mask_ok", True),
+        }
+    return rows
+
+
+def recompute_table(results, w_vol, w_grav, w_col,
+                    w_taper, w_dir, w_spd, w_edge):
+    """Same NA-renormalization semantics as checks.py, custom weights."""
+    gw = {"taper": w_taper, "direction": w_dir,
+          "speedup": w_spd, "leading_edge": w_edge}
+    rows = []
+    for clip, d in results.items():
+        avail_g = {k: v for k, v in d["grav"].items()
+                   if v is not None and gw[k] > 0}
+        g_wsum = sum(gw[k] for k in avail_g)
+        gravity = (sum(gw[k] * v for k, v in avail_g.items()) / g_wsum
+                   if g_wsum > 0 else None)
+
+        axes = {"volume": (d["volume"], w_vol),
+                "gravity": (gravity, w_grav),
+                "color": (d["color"], w_col)}
+        avail = {k: (s, w) for k, (s, w) in axes.items()
+                 if s is not None and w > 0}
+        wsum = sum(w for _, w in avail.values())
+        comp = (sum(s * w for s, w in avail.values()) / wsum
+                if wsum > 0 else None)
+
+        fmt = lambda x: "NA" if x is None else round(x, 3)
+        rows.append([clip[:40], str(d["mask_ok"]), fmt(d["volume"]),
+                     fmt(d["color"]), fmt(gravity), fmt(comp)])
+    rows.sort(key=lambda r: (r[5] == "NA", -(r[5] if r[5] != "NA" else 0)))
+    return rows
+
+
+def weights_snippet(w_vol, w_grav, w_col, w_taper, w_dir, w_spd, w_edge):
+    t = w_vol + w_grav + w_col
+    g = w_taper + w_dir + w_spd + w_edge
+    if t <= 0 or g <= 0:
+        return "all weights zero -- nothing to export"
+    return (
+        "# paste into checks.py\n"
+        f"GRAVITY_WEIGHTS = {{'taper': {w_taper/g:.3f}, "
+        f"'direction': {w_dir/g:.3f}, 'speedup': {w_spd/g:.3f}, "
+        f"'leading_edge': {w_edge/g:.3f}}}\n"
+        f"# composite_score defaults:\n"
+        f"# w_volume={w_vol/t:.3f}, w_gravity={w_grav/t:.3f}, "
+        f"w_color={w_col/t:.3f}")
+
+
+# ---------------------------------------------------------------------------
 # Auto-SAM test tab
 # ---------------------------------------------------------------------------
 
@@ -440,6 +514,54 @@ def build_demo(clips_dir, masks_dir, flow_dir, results_dir,
                                                       regions),
                 inputs=[clip_dd, regions_state],
                 outputs=[status_tb])
+
+        with gr.Tab("⚖️ Weights"):
+            results_holder = {"data": load_all_results(results_dir)}
+            gr.Markdown(
+                "Drag to re-weight the scoring axes and gravity "
+                "components; the leaderboard re-ranks live (NA handling "
+                "matches checks.py: weights renormalize over whatever "
+                "each clip could measure). Zero a slider to exclude that "
+                "signal entirely. Copy the snippet into checks.py once "
+                "you like the balance.")
+            with gr.Row():
+                s_vol = gr.Slider(0, 1, 0.55, step=0.05, label="Volume")
+                s_grav = gr.Slider(0, 1, 0.50, step=0.05, label="Gravity")
+                s_col = gr.Slider(0, 1, 0.30, step=0.05, label="Color")
+            with gr.Row():
+                s_taper = gr.Slider(0, 1, 0.35, step=0.05, label="grav: taper")
+                s_dir = gr.Slider(0, 1, 0.25, step=0.05, label="grav: direction")
+                s_spd = gr.Slider(0, 1, 0.85, step=0.05, label="grav: speedup")
+                s_edge = gr.Slider(0, 1, 0.25, step=0.05, label="grav: leading edge")
+            reload_btn = gr.Button("↻ Reload results (after re-scoring)")
+            table = gr.Dataframe(
+                headers=["clip", "mask_ok", "volume", "color",
+                         "gravity", "composite"],
+                value=recompute_table(results_holder["data"],
+                                      0.55, 0.50, 0.30,
+                                      0.35, 0.25, 0.85, 0.25),
+                interactive=False)
+            snippet = gr.Code(
+                value=weights_snippet(0.55, 0.50, 0.30,
+                                      0.35, 0.25, 0.85, 0.25),
+                language="python", label="Export")
+
+            w_inputs = [s_vol, s_grav, s_col, s_taper, s_dir, s_spd, s_edge]
+
+            def on_weights(*ws):
+                return (recompute_table(results_holder["data"], *ws),
+                        weights_snippet(*ws))
+
+            def on_reload(*ws):
+                results_holder["data"] = load_all_results(results_dir)
+                return (recompute_table(results_holder["data"], *ws),
+                        weights_snippet(*ws))
+
+            for s in w_inputs:
+                s.release(fn=on_weights, inputs=w_inputs,
+                          outputs=[table, snippet])
+            reload_btn.click(fn=on_reload, inputs=w_inputs,
+                             outputs=[table, snippet])
 
         for name in clip_names:
             short = name[:24] + ("…" if len(name) > 24 else "")
