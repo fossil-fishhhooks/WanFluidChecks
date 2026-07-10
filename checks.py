@@ -31,6 +31,7 @@ median-smoothed area trend, plus a dropout penalty for regions that
 vanish mid-clip.
 """
 
+import cv2
 import numpy as np
 
 
@@ -95,7 +96,29 @@ def volume_check(region_masks_by_frame, smooth_k=5,
         notes.append(f"{n_dropout} frame(s) where liquid nearly vanished")
     dropout_factor = float(max(0.0, 1.0 - 2.0 * n_dropout / n_frames))
 
-    score = base * dropout_factor
+    conservation = base * dropout_factor
+
+    # ---- pool-fill: while the stream is active, the pool should not
+    # shrink (liquid arriving must accumulate). Spearman of pool area vs
+    # time over stream-active frames; mildly weighted -- splash and
+    # segmentation jitter are tolerated, sustained draining is not.
+    fill_score, fill_rho = None, None
+    pool = region_masks_by_frame.get("pool")
+    strm = region_masks_by_frame.get("stream")
+    if pool is not None and strm is not None:
+        active = [i for i in range(n_frames)
+                  if strm[i].any() and pool[i].any()]
+        if len(active) >= 6:
+            areas = [float(pool[i].sum()) for i in active]
+            fill_rho = _spearman(active, areas)
+            fill_score = 1.0 if fill_rho >= -0.1 else max(0.0, 1.0 + fill_rho)
+            if fill_rho < -0.3:
+                notes.append(f"pool shrinks while the stream is pouring "
+                             f"(area-vs-time rho={fill_rho:+.2f}) -- "
+                             f"liquid draining away instead of accumulating")
+
+    score = (conservation if fill_score is None
+             else 0.85 * conservation + 0.15 * fill_score)
 
     return {
         "total_area": total_area.tolist(),
@@ -103,6 +126,9 @@ def volume_check(region_masks_by_frame, smooth_k=5,
         "deviation_p90": p90,
         "deviation_max": p_max,
         "dropout_frames": [int(i) for i in np.nonzero(dropout)[0]],
+        "conservation_score": float(conservation),
+        "pool_fill_score": fill_score,
+        "pool_fill_rho": fill_rho,
         "score": float(score),
         "notes": notes,
     }
@@ -157,6 +183,7 @@ def compensate_background_motion(flow_by_frame, liquid_masks_by_frame,
 # ---------------------- gravity component A: direction ----------------------
 
 def gravity_direction(flow_by_frame, stream_masks_by_frame,
+                      conf_by_frame=None,
                       noise_floor=0.25, min_moving_frac=0.03,
                       min_coherence=0.3):
     """
@@ -193,6 +220,11 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
         flow, mask = flow_by_frame[i], stream_masks_by_frame[i]
         if mask.shape != flow.shape[:2] or not mask.any():
             continue
+        if conf_by_frame is not None and i < len(conf_by_frame) \
+                and conf_by_frame[i].shape == mask.shape:
+            mask = mask & conf_by_frame[i]   # drop unreliable flow pixels
+            if not mask.any():
+                continue
         n_aligned += 1
         v = flow[mask]
         mag = np.linalg.norm(v, axis=1)
@@ -257,6 +289,7 @@ def gravity_direction(flow_by_frame, stream_masks_by_frame,
 # ---------------------- gravity component B: speedup ----------------------
 
 def gravity_speedup(flow_by_frame, stream_masks_by_frame,
+                    conf_by_frame=None,
                     noise_floor=0.25, min_bin_pixels=8, min_samples=5):
     """
     Free-fall kinematics under gravity: v^2 = v0^2 + 2*a*(y - y0).
@@ -282,6 +315,11 @@ def gravity_speedup(flow_by_frame, stream_masks_by_frame,
         flow, mask = flow_by_frame[i], stream_masks_by_frame[i]
         if mask.shape != flow.shape[:2] or not mask.any():
             continue
+        if conf_by_frame is not None and i < len(conf_by_frame) \
+                and conf_by_frame[i].shape == mask.shape:
+            mask = mask & conf_by_frame[i]   # drop unreliable flow pixels
+            if not mask.any():
+                continue
         ys, xs = np.nonzero(mask)
         vy = flow[ys, xs, 1]
         keep = np.abs(vy) > noise_floor
@@ -316,6 +354,24 @@ def gravity_speedup(flow_by_frame, stream_masks_by_frame,
     ss_res = float(np.sum((v2_arr - pred) ** 2))
     ss_tot = float(np.sum((v2_arr - v2_arr.mean()) ** 2))
     r2 = max(0.0, min(1.0, 1.0 - ss_res / ss_tot)) if ss_tot > 1e-9 else 0.0
+
+    # significance gate: a slope indistinguishable from zero is NOT a
+    # physics violation, it is the absence of a measurable acceleration
+    # signal (splash/edge pixels rarely trace clean v^2-vs-y curves).
+    # Report NA instead of penalizing sign-of-noise -- this also keeps
+    # the NA-renormalization fair between clips with and without usable
+    # flow, rather than dragging only the ones where noise got scored.
+    dof = max(len(y_arr) - 2, 1)
+    y_ss = float(np.sum((y_arr - y_arr.mean()) ** 2))
+    slope_se = float(np.sqrt((ss_res / dof) / max(y_ss, 1e-12)))
+    if abs(slope) < 2.0 * slope_se:
+        return {"n_samples": len(samples_y),
+                "slope_v2_vs_y": float(slope),
+                "slope_stderr": slope_se,
+                "score": None,
+                "notes": [f"no measurable acceleration signal (v^2-vs-y "
+                          f"slope {slope:.3g} within noise, "
+                          f"se={slope_se:.3g}) -- not scored"]}
 
     mean_vy = sum_vy / count_vy if count_vy > 0 else 0.0
     if mean_vy >= 0:
@@ -566,10 +622,13 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
         return band is None or not (band[0] <= y <= band[1])
 
     # ---- per-frame tint of the liquid vs background ----
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     tints, mags = [], []
     for i in range(n):
         liquid = np.logical_or.reduce(
             [region_masks_by_frame[r][i] for r in region_masks_by_frame])
+        # erode 2px to exclude edge pixels (lighting, semi-transparency)
+        liquid = cv2.erode(liquid.astype(np.uint8), kernel, iterations=2).astype(bool)
         if liquid.sum() < min_pixels:
             continue
         h = liquid.shape[0]
@@ -635,7 +694,10 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
     worst_frac = 0.0
     n_src = min(n, len(source_masks))
     for i in range(n_src - 1):
-        s0, s1 = source_masks[i], source_masks[i + 1]
+        s0 = cv2.erode(source_masks[i].astype(np.uint8), kernel,
+                       iterations=2).astype(bool)
+        s1 = cv2.erode(source_masks[i + 1].astype(np.uint8), kernel,
+                       iterations=2).astype(bool)
         if not s0.any() or not s1.any():
             continue
         overlap = s0 & s1
@@ -653,7 +715,8 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
     # ---- spatial: along-stream hue consistency + thin->clear bonus ----
     row_hue, row_chroma, row_mag, row_w = [], [], [], []
     for i in range(min(n, len(stream_masks))):
-        m = stream_masks[i]
+        m = cv2.erode(stream_masks[i].astype(np.uint8), kernel,
+                      iterations=2).astype(bool)
         if not m.any():
             continue
         liquid = np.logical_or.reduce(
@@ -692,10 +755,72 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
         # a uniform stream is not a violation
         spatial = row_hue_stab * (0.75 + 0.25 * max(0.0, width_tint_rho))
 
+    # ---- source-to-stream color match penalty ----
+    # If source is solid colored but the stream just below it is clear,
+    # that's a fake-looking color change (not thinning at edges).
+    src_masks = region_masks_by_frame.get("source", [])
+    str_masks = region_masks_by_frame.get("stream", [])
+    source_stream_pairs = []
+    nn = min(n, len(src_masks), len(str_masks))
+    # Quick pre-check: skip if no frame has enough source pixels
+    src_has_any = any(
+        m.astype(np.uint8).sum() >= min_pixels for m in src_masks[:min(5, len(src_masks))])
+    if src_has_any:
+        for i in range(nn):
+            s = cv2.erode(src_masks[i].astype(np.uint8), kernel,
+                          iterations=2).astype(bool)
+            st = cv2.erode(str_masks[i].astype(np.uint8), kernel,
+                           iterations=2).astype(bool)
+            if s.sum() < min_pixels or st.sum() < min_pixels:
+                continue
+            src_rows = np.nonzero(s.any(axis=1))[0]
+            if len(src_rows) == 0:
+                continue
+            src_bottom = int(src_rows.max())
+            # stream top band = rows just below source bottom
+            top_band = st & (np.arange(st.shape[0])[:, None] >= src_bottom) & \
+                       (np.arange(st.shape[0])[:, None] < src_bottom + 25)
+            if top_band.sum() < min_pixels:
+                continue
+            liquid = np.logical_or.reduce(
+                [region_masks_by_frame[r][i] for r in region_masks_by_frame])
+            bg = ~liquid
+            if bg.sum() < min_pixels:
+                continue
+            bg_med = np.median(lab[i][bg], axis=0)
+            src_med = np.median(lab[i][s], axis=0)
+            top_med = np.median(lab[i][top_band], axis=0)
+            src_tint = src_med - bg_med
+            top_tint = top_med - bg_med
+            src_chroma = np.hypot(src_tint[1], src_tint[2])
+            top_chroma = np.hypot(top_tint[1], top_tint[2])
+            source_stream_pairs.append((src_chroma, top_chroma))
+
+    src_str_penalty = 1.0
+    src_str_note = None
+    if len(source_stream_pairs) >= 4:
+        src_chromas = np.array([p[0] for p in source_stream_pairs])
+        top_chromas = np.array([p[1] for p in source_stream_pairs])
+        src_median_chroma = float(np.median(src_chromas))
+        top_median_chroma = float(np.median(top_chromas))
+        # source is solid-colored if median chroma > 12 AND low variance
+        src_stable = np.std(src_chromas) < max(5.0, src_median_chroma * 0.4)
+        src_colored = src_median_chroma > 12.0
+        # stream top is clearer than source by a meaningful margin
+        stream_clearer = top_median_chroma < src_median_chroma * 0.4
+        if src_colored and src_stable and stream_clearer:
+            ratio = max(0.0, 1.0 - top_median_chroma / max(src_median_chroma, 1e-6))
+            src_str_penalty = max(0.6, 1.0 - 0.4 * ratio)
+            src_str_note = (
+                f"source is solid colored (chroma={src_median_chroma:.1f}) "
+                f"but stream just below is clear (chroma={top_median_chroma:.1f}) "
+                f"-- fake color change at pour point"
+            )
+
     if spatial is None:
-        score = temporal
+        score = temporal * src_str_penalty
     else:
-        score = 0.7 * temporal + 0.3 * spatial
+        score = (0.7 * temporal + 0.3 * spatial) * src_str_penalty
 
     notes = [x for x in [hue_note] if x]
     if gain_metric > 0.15:
@@ -706,6 +831,8 @@ def color_consistency(frames_bgr, region_masks_by_frame, stream_masks,
         notes.append(f"large abrupt color change in source region: "
                      f"{100*worst_frac:.0f}% of area shifted by >{dE_threshold} "
                      f"dE between consecutive frames")
+    if src_str_note:
+        notes.append(src_str_note)
 
     return {
         "n_frames_used": len(tints),

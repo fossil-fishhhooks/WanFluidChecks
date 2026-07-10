@@ -56,9 +56,12 @@ def load_sam2_video_predictor():
 
 
 def normalize_regions(regions):
-    """Accept v1 format (no frame_idx -> 0) and v2 format."""
+    """Accept v1 format (no frame_idx -> 0) and v2 format. Keys starting
+    with '_' (e.g. auto_annotate's '_auto' metadata) are ignored."""
     out = {}
     for name, data in regions.items():
+        if name.startswith("_"):
+            continue
         out[name] = {
             "frame_idx": int(data.get("frame_idx", 0)),
             "points": data["points"],

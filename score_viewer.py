@@ -88,7 +88,7 @@ class ClipData:
                 self._flows = []
                 return None
             files = sorted(f for f in os.listdir(self._flow_dir)
-                           if f.endswith(".npy"))
+                           if f.startswith("frame_") and f.endswith(".npy"))
             self._flows = [np.load(os.path.join(self._flow_dir, f))
                            for f in files]
         if i < len(self._flows):
@@ -310,7 +310,77 @@ def build_score_html(result):
 # Gradio app
 # ---------------------------------------------------------------------------
 
-def build_demo(clips_dir, masks_dir, flow_dir, results_dir):
+# ---------------------------------------------------------------------------
+# Auto-SAM test tab
+# ---------------------------------------------------------------------------
+
+_AMG = None  # lazy singleton -- loading SAM2 takes a few seconds
+
+
+def _get_amg():
+    global _AMG
+    if _AMG is None:
+        from auto_annotate import load_amg
+        _AMG = load_amg()
+    return _AMG
+
+
+def _autosam_preview(frame_bgr, regions):
+    """Render role masks are not stored -- draw prompt points + labels."""
+    out = frame_bgr.copy()
+    for role, data in regions.items():
+        if role.startswith("_"):
+            continue
+        color = OVERLAY_COLORS.get(role, (255, 255, 255))
+        for (x, y) in data["points"]:
+            cv2.circle(out, (int(x), int(y)), 6, color, 2, cv2.LINE_AA)
+        if data["points"]:
+            x, y = data["points"][0]
+            cv2.putText(out, role, (int(x) + 8, int(y) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    return out
+
+
+def run_autosam(clips_dir, clip_name):
+    """Run auto-annotation on one clip; returns (preview_rgb, json_str,
+    status, regions_state)."""
+    from auto_annotate import load_all_frames, auto_annotate_clip
+    if not clip_name:
+        return None, "", "Pick a clip first.", None
+    path = os.path.join(clips_dir, clip_name)
+    frames = load_all_frames(path)
+    if not frames:
+        return None, "", f"Could not read {clip_name}", None
+    amg = _get_amg()
+    regions, conf, idx = auto_annotate_clip(amg, frames)
+    if not regions:
+        return (cv2.cvtColor(frames[len(frames) // 2], cv2.COLOR_BGR2RGB),
+                "", "No stream candidate found -- annotate manually.", None)
+    roles = [r for r in regions if not r.startswith("_")]
+    preview = _autosam_preview(frames[idx], regions)
+    status = (f"keyframe {idx} | roles: {', '.join(roles)} | "
+              f"confidence {conf:.2f}"
+              + ("  (LOW -- review before trusting)" if conf < 0.25 else ""))
+    return (cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+            json.dumps(regions, indent=2), status, regions)
+
+
+def save_autosam(prompts_path, clip_name, regions):
+    if not regions or not clip_name:
+        return "Nothing to save -- run detection first."
+    existing = {}
+    if os.path.exists(prompts_path):
+        with open(prompts_path) as f:
+            existing = json.load(f)
+    existing[clip_name] = regions
+    with open(prompts_path, "w") as f:
+        json.dump(existing, f, indent=2)
+    return (f"Saved {clip_name} -> {prompts_path}. "
+            f"Run segment.py (--redo if re-segmenting) to apply.")
+
+
+def build_demo(clips_dir, masks_dir, flow_dir, results_dir,
+               prompts_path="prompts.json"):
     clip_names = sorted(
         d for d in os.listdir(masks_dir)
         if os.path.isdir(os.path.join(masks_dir, d))
@@ -338,6 +408,38 @@ def build_demo(clips_dir, masks_dir, flow_dir, results_dir):
     demo = gr.Blocks(title="Wan2.1 Score Viewer")
     with demo:
         gr.Markdown("# Arin's Wan2.1 Video Fluid Physics Score Viewer")
+
+        with gr.Tab("🤖 Auto-SAM"):
+            all_clips = sorted(
+                f for f in os.listdir(clips_dir)
+                if f.lower().endswith((".mp4", ".mov", ".avi")))
+            gr.Markdown(
+                "Test automatic annotation on any clip: runs SAM2's "
+                "automatic mask generator + pour-scene geometry to pick "
+                "source/stream/pool and synthesize prompt points. Review "
+                "the preview, then save into prompts.json.")
+            with gr.Row():
+                clip_dd = gr.Dropdown(all_clips, label="Clip",
+                                      value=all_clips[0] if all_clips else None)
+                run_btn = gr.Button("Run detection", variant="primary")
+                save_btn = gr.Button("Save to prompts.json")
+            status_tb = gr.Textbox(label="Status", interactive=False)
+            with gr.Row():
+                prev_img = gr.Image(type="numpy", height=432,
+                                    label="Keyframe + prompt points")
+                json_tb = gr.Textbox(label="Generated prompts (v2 format)",
+                                     lines=18)
+            regions_state = gr.State(None)
+
+            run_btn.click(
+                fn=lambda name: run_autosam(clips_dir, name),
+                inputs=[clip_dd],
+                outputs=[prev_img, json_tb, status_tb, regions_state])
+            save_btn.click(
+                fn=lambda name, regions: save_autosam(prompts_path, name,
+                                                      regions),
+                inputs=[clip_dd, regions_state],
+                outputs=[status_tb])
 
         for name in clip_names:
             short = name[:24] + ("…" if len(name) > 24 else "")
@@ -384,11 +486,12 @@ def main():
     parser.add_argument("--masks_dir", default="./masks")
     parser.add_argument("--flow_dir", default="./flow")
     parser.add_argument("--results_dir", default="./results")
+    parser.add_argument("--prompts", default="prompts.json")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
 
     demo = build_demo(args.clips_dir, args.masks_dir, args.flow_dir,
-                      args.results_dir)
+                      args.results_dir, prompts_path=args.prompts)
     demo.launch(server_port=args.port)
 
 

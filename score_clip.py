@@ -21,6 +21,7 @@ import cv2
 from checks import (
     volume_check,
     color_consistency,
+    compensate_background_motion,
     gravity_taper,
     gravity_direction,
     gravity_speedup,
@@ -54,10 +55,15 @@ def load_region_frames(region_dir):
 
 
 def load_flow_frames(flow_dir_for_clip):
+    """Returns (flow_frames, conf_frames); conf empty for old flow dirs."""
     if not flow_dir_for_clip or not os.path.isdir(flow_dir_for_clip):
-        return []
-    files = sorted(f for f in os.listdir(flow_dir_for_clip) if f.endswith(".npy"))
-    return [np.load(os.path.join(flow_dir_for_clip, f)) for f in files]
+        return [], []
+    files = sorted(os.listdir(flow_dir_for_clip))
+    flow = [np.load(os.path.join(flow_dir_for_clip, f))
+            for f in files if f.startswith("frame_") and f.endswith(".npy")]
+    conf = [np.load(os.path.join(flow_dir_for_clip, f))
+            for f in files if f.startswith("conf_") and f.endswith(".npy")]
+    return flow, conf
 
 
 def pad_to_same_length(region_frames):
@@ -75,6 +81,33 @@ def pad_to_same_length(region_frames):
     return out
 
 
+def stream_mask_sanity(stream_frames):
+    """Geometry plausibility of the tracked stream: a pour stream should
+    be tall and thin on most frames. A 'stream' mask that is squat or
+    huge is almost certainly a segmentation failure (glass, container,
+    merged regions) -- physics scores computed on it are meaningless.
+    Returns (ok, note_or_None)."""
+    aspects, areas = [], []
+    for m in stream_frames:
+        ys, xs = np.nonzero(m)
+        if len(ys) < 30:
+            continue
+        h = ys.max() - ys.min() + 1
+        w = xs.max() - xs.min() + 1
+        aspects.append(h / max(w, 1))
+        areas.append(len(ys) / m.size)
+    if not aspects:
+        return False, "stream mask empty on all frames"
+    med_aspect = float(np.median(aspects))
+    med_area = float(np.median(areas))
+    if med_aspect < 1.8 or med_area > 0.20:
+        return False, (f"stream mask geometry implausible (median "
+                       f"aspect={med_aspect:.1f}, area={100*med_area:.0f}% "
+                       f"of frame) -- likely SEGMENTATION failure, not a "
+                       f"physics failure; re-annotate this clip")
+    return True, None
+
+
 def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
     region_frames = {r: load_region_frames(os.path.join(clip_masks_dir, r))
                      for r in REGIONS}
@@ -85,12 +118,13 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
     vol = volume_check(padded)
 
     stream = region_frames["stream"]
-    flow = load_flow_frames(flow_dir_for_clip)
+    flow, conf = load_flow_frames(flow_dir_for_clip)
 
     # liquid union = source | stream | pool — used for flow measurement
     liquid_union = [padded["source"][i] | padded["stream"][i] |
                     padded["pool"][i] for i in range(len(padded["stream"]))]
 
+    drift_info = None
     if not stream:
         na = {"score": None, "notes": ["no stream masks saved"]}
         taper_r, dir_r, spd_r, edge_r = dict(na), dict(na), dict(na), dict(na)
@@ -98,14 +132,28 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
         taper_r = gravity_taper(stream)
         edge_r = gravity_leading_edge(stream)
         if flow:
-            dir_r = gravity_direction(flow, liquid_union)
-            spd_r = gravity_speedup(flow, liquid_union)
+            # subtract camera/scene drift that RAFT paints into
+            # textureless liquid interiors
+            flow_c, drifts = compensate_background_motion(flow, liquid_union)
+            drift_mags = [float(np.hypot(dx, dy)) for dx, dy in drifts]
+            drift_info = {
+                "per_frame_drift": drifts,
+                "mean_drift_magnitude":
+                    float(np.mean(drift_mags)) if drift_mags else 0.0,
+            }
+            dir_r = gravity_direction(flow_c, liquid_union, conf)
+            spd_r = gravity_speedup(flow_c, liquid_union, conf)
         else:
             miss = {"score": None,
                     "notes": ["no flow files -- run flow.py and pass --flow_dir"]}
             dir_r, spd_r = dict(miss), dict(miss)
 
     grav = combine_gravity(taper_r, dir_r, spd_r, edge_r)
+
+    mask_ok, mask_note = (stream_mask_sanity(stream) if stream
+                          else (False, "no stream masks saved"))
+    if mask_note:
+        grav.setdefault("notes", []).append(mask_note)
 
     frames = load_clip_frames(clip_path)
     if frames and stream:
@@ -125,11 +173,13 @@ def score_one_clip(clip_masks_dir, flow_dir_for_clip, clip_path=None):
     return {
         "volume_check": vol,
         "color_check": color_r,
+        "background_drift": drift_info,
         "gravity_taper": taper_r,
         "gravity_direction": dir_r,
         "gravity_speedup": spd_r,
         "gravity_leading_edge": edge_r,
         "gravity_combined": grav,
+        "stream_mask_ok": mask_ok,
         "scores": combined,
     }
 
@@ -173,7 +223,9 @@ def main():
                        result["gravity_leading_edge"])
         rows.append({
             "clip": clip_name,
+            "mask_ok": result["stream_mask_ok"],
             "volume": _fmt(s["volume_score"]),
+            "pool_fill": _fmt(result["volume_check"].get("pool_fill_score")),
             "color": _fmt(s["color_score"]),
             "grav_taper": _fmt(t["score"]),
             "grav_direction": _fmt(d["score"]),
@@ -192,6 +244,10 @@ def main():
         all_notes = (result["volume_check"].get("notes", [])
                      + result["color_check"].get("notes", [])
                      + result["gravity_combined"].get("notes", []))
+        drift = result.get("background_drift")
+        if drift and drift["mean_drift_magnitude"] > 0.3:
+            all_notes.append(f"compensated camera/scene drift of "
+                             f"{drift['mean_drift_magnitude']:.2f} px/frame")
         seen = set()
         for note in all_notes:
             if note not in seen:
